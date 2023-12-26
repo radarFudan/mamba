@@ -293,6 +293,10 @@ class Mamba(nn.Module):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
+    def reset_parameters(self) -> None:
+        print("reset_parameters called in Mamba, consider implement it and check the usage")
+        pass
+
 
 class Block(nn.Module):
     def __init__(
