@@ -10,7 +10,7 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, selective_scan_ref, mamba_inner_ref
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -18,9 +18,9 @@ except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None
 
 try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update, selective_state_update_ref
 except ImportError:
-    selective_state_update = None
+    selective_state_update, selective_state_update_ref = None, None
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -116,14 +116,22 @@ class Mamba(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, mamba_cache=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
         batch, seqlen, dim = hidden_states.shape
 
-        conv_state, ssm_state = None, None
+        # conv_state, ssm_state = None, None
+
+
+        if mamba_cache is not None:
+            cache_conv_state, cache_ssm_state = mamba_cache
+            cache_conv_state, cache_ssm_state = cache_conv_state.to(dtype=self.conv1d.weight.dtype), cache_ssm_state.to(dtype=self.dt_proj.weight.dtype)
+        # The next thing is to use hidden_states, cache_conv_state, cache_ssm_state to get the new hdiden states, new conv_state, ssm_states. 
+
+
         if inference_params is not None:
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
@@ -142,8 +150,14 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+
+
+        # print("Using use_fast_path = ", self.use_fast_path)
+
+
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
-            out = mamba_inner_fn(
+            # out, new_cache_conv_state, new_cache_ssm_state = mamba_inner_fn(
+            out, new_cache_conv_state, new_cache_ssm_state = mamba_inner_ref(
                 xz,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -155,16 +169,20 @@ class Mamba(nn.Module):
                 None,  # input-dependent B
                 None,  # input-dependent C
                 self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
+                delta_bias=self.dt_proj.bias.float(), 
+                delta_softplus=True, 
+                cache_conv_state=cache_conv_state, 
+                cache_ssm_state=cache_ssm_state, 
             )
         else:
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
-            if conv_state is not None:
+            # if conv_state is not None:
+            if cache_conv_state is not None:
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+                # conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+                cache_conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
@@ -186,7 +204,8 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            y = selective_scan_fn(
+            # y = selective_scan_fn(
+            y = selective_scan_ref(
                 x,
                 dt,
                 A,
@@ -196,14 +215,27 @@ class Mamba(nn.Module):
                 z=z,
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
-                return_last_state=ssm_state is not None,
+                # return_last_state=ssm_state is not None,
+                return_last_state=cache_ssm_state is not None,
+                cache_ssm_state=cache_ssm_state,
             )
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
-        return out
+
+
+
+        # TODO
+        conv_state = new_cache_conv_state # Need find the right way to set it. 
+        ssm_state = cache_ssm_state # Need find the right way to set it.
+
+
+        mamba_cache = conv_state, ssm_state
+
+
+        return out, mamba_cache
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
@@ -235,7 +267,7 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
-        if selective_state_update is None:
+        if selective_state_update_ref is None:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
@@ -245,7 +277,7 @@ class Mamba(nn.Module):
             y = y + self.D.to(dtype) * x
             y = y * self.act(z)  # (B D)
         else:
-            y = selective_state_update(
+            y = selective_state_update_ref(
                 ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
             )
 

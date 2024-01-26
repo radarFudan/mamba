@@ -19,6 +19,7 @@ struct SSMScanParamsBase {
     void *__restrict__ b_ptr;
     void *__restrict__ out_ptr;
     void *__restrict__ x_ptr;
+    void *__restrict__ cache_ssm_state_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -53,6 +54,9 @@ struct SSMParamsBase {
     index_t out_d_stride;
     index_t out_z_batch_stride;
     index_t out_z_d_stride;
+    index_t cache_ssm_state_batch_stride;
+    index_t cache_ssm_state_d_stride;
+    index_t cache_ssm_state_n_stride;
 
     // Common data pointers.
     void *__restrict__ A_ptr;
@@ -66,6 +70,7 @@ struct SSMParamsBase {
     void *__restrict__ x_ptr;
     void *__restrict__ z_ptr;
     void *__restrict__ out_z_ptr;
+    void *__restrict__ cache_ssm_state_ptr;
 };
 
 struct SSMParamsBwd: public SSMParamsBase {
