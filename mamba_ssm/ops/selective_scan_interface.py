@@ -10,6 +10,8 @@ from causal_conv1d import causal_conv1d_fn
 import causal_conv1d_cuda
 import selective_scan_cuda
 
+from jax_compat import associative_scan
+
 
 class SelectiveScanFn(torch.autograd.Function):
 
@@ -150,6 +152,85 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
     return out if not return_last_state else (out, last_state)
+
+
+def selective_scan_ref_speedup(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+                      return_last_state=False):
+    """
+    u: r(B D L)
+    delta: r(B D L)
+    A: c(D N) or r(D N)
+    B: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    C: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    D: r(D)
+    z: r(B D L)
+    delta_bias: r(D), fp32
+
+    out: r(B D L)
+    last_state (optional): r(B D dstate) or c(B D dstate)
+    """
+    dtype_in = u.dtype
+    u = u.float()
+    delta = delta.float()
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None].float()
+    if delta_softplus:
+        delta = F.softplus(delta)
+    batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+    is_variable_B = B.dim() >= 3
+    is_variable_C = C.dim() >= 3
+    if A.is_complex():
+        if is_variable_B:
+            B = torch.view_as_complex(rearrange(B.float(), "... (L two) -> ... L two", two=2))
+        if is_variable_C:
+            C = torch.view_as_complex(rearrange(C.float(), "... (L two) -> ... L two", two=2))
+    else:
+        B = B.float()
+        C = C.float()
+    x = A.new_zeros((batch, dim, dstate))
+    ys = []
+    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    if not is_variable_B:
+        deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+    else:
+        if B.dim() == 3:
+            deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+        else:
+            B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+            deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+    if is_variable_C and C.dim() == 4:
+        C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+
+    # Fast version, use associative_scan instead of for loop, as a simple patch. 
+    # deltaA: B * D * L * N
+    # deltaB_u: B * D * L * N
+    # If one want to pass in the last state, one should pad the deltaA and deltaB_u
+    # deltaA = torch.cat([torch.ones_like(deltaA[:,:,-1:,:]), deltaA], dim=-2)
+    # deltaB_u = torch.cat([x.reshape(batch,dim,1,dstate).to(deltaB_u.device), deltaB_u], dim=-2)
+    _, hs = associative_scan(binary_operator, (deltaA, deltaB_u), axis=2) # B * D * L * N
+    y = torch.einsum('b d l n, b n l -> b d l', hs[:,:,:,:], C)
+
+    assert x.shape == hs[:,:,0,:].shape, "x and hs[:,:,0,:] should have the same shape"
+    last_state = hs[:,:,-1,:]
+
+    out = y if D is None else y + u * rearrange(D, "d -> d 1")
+    if z is not None:
+        out = out * F.silu(z)
+    out = out.to(dtype=dtype_in)
+    return out if not return_last_state else (out, last_state)
+
+
+def binary_operator(q_i, q_j):
+    """ Binary operator for parallel scan of linear recurrence. Assumes a diagonal matrix A.
+        Args:
+            q_i: tuple containing A_i and Bu_i at position i       (D,N), (D,N)
+            q_j: tuple containing A_j and Bu_j at position j       (D,N), (D,N)
+        Returns:
+            new element ( A_out, Bu_out )
+    """
+    A_i, b_i = q_i
+    A_j, b_j = q_j
+    return A_j * A_i, A_j * b_i + b_j
 
 
 class MambaInnerFn(torch.autograd.Function):
@@ -318,7 +399,7 @@ def mamba_inner_ref(
     delta_rank = delta_proj_weight.shape[1]
     d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
     x, z = xz.chunk(2, dim=1)
-    x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, "silu")
+    x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, activation="silu")
     # We're being very careful here about the layout, to avoid extra transposes.
     # We want delta to have d as the slowest moving dimension
     # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
@@ -341,5 +422,11 @@ def mamba_inner_ref(
             C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
         else:
             C = rearrange(C, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous()
+    print("selective_scan_cuda")
     y = selective_scan_fn(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+    # print("selective_scan_ref")
+    # y = selective_scan_ref(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+    # print("selective_scan_ref_speedup")
+    # y = selective_scan_ref_speedup(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+            
     return F.linear(rearrange(y, "b d l -> b l d"), out_proj_weight, out_proj_bias)
